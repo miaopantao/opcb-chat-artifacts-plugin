@@ -405,21 +405,53 @@ export async function readText(source, signal, request = fetch) {
 	return { text: new TextDecoder().decode(data), truncated };
 }
 
+// Plugin-owned bookmarks only. Never read other storage keys or message bodies.
+// Web Storage can be unavailable; the board keeps working and reports save failure.
+export function bookmarkKey(scope, viewer, channelId) {
+	return `opcb.chat-artifacts:stars:v1:${JSON.stringify([scope, viewer, channelId])}`;
+}
+export function readBookmarks(storage, key) {
+	try {
+		const raw = storage?.getItem(key);
+		if (!raw || raw.length > 262144) return [];
+		const values = JSON.parse(raw);
+		return Array.isArray(values)
+			? [
+					...new Set(
+						values.filter((id) => typeof id === "string" && id.length <= 4096),
+					),
+				].slice(0, 1000)
+			: [];
+	} catch {
+		return [];
+	}
+}
+export function saveBookmarks(storage, key, ids) {
+	try {
+		if (!storage || ids.length > 1000) return false;
+		const raw = JSON.stringify(ids);
+		if (raw.length > 262144) return false;
+		storage.setItem(key, raw);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 export function apply(ctx) {
 	const R = ctx.react,
 		h = R.createElement;
 	const prefix = "opcb:chat-artifacts:";
 	const labels = {
 		all: "全部",
-		image: "图片",
-		video: "视频",
-		document: "文档",
 		website: "网站",
 		link: "链接",
+		document: "文档",
+		image: "图片",
+		video: "视频",
 		other: "其他",
 	};
-	const gap = "var(--space-2)",
-		inset = "var(--space-panel-inset)";
+	const gap = "var(--space-2)";
 	const rowStyle = {
 		display: "flex",
 		gap,
@@ -430,6 +462,248 @@ export function apply(ctx) {
 		h("p", { role: "status", style: { color: "var(--text-subtle)" } }, text);
 	const button = (text, onClick, props = {}) =>
 		h("button", { type: "button", onClick, ...props }, text);
+	const selectedStyle = (active) => ({
+		background: active ? "var(--surface-inset)" : "transparent",
+		color: active ? "var(--text-standard)" : "var(--text-subtle)",
+		border: "1px solid transparent",
+		borderRadius: "var(--radius-control, 8px)",
+		minHeight: 32,
+		padding: "4px 8px",
+	});
+	function Icon({ type, size = 20 }) {
+		const paths = {
+			grid: "M3 3h7v7H3z M14 3h7v7h-7z M3 14h7v7H3z M14 14h7v7h-7z",
+			list: "M8 5h13 M8 12h13 M8 19h13 M3 5h.01 M3 12h.01 M3 19h.01",
+			star: "m12 2 3 6.4 7 .9-5.1 5 1.3 7L12 18l-6.2 3.3 1.3-7L2 9.3l7-.9Z",
+			more: "M4 12h.01 M12 12h.01 M20 12h.01",
+			external: "M14 3h7v7 M21 3l-12 12 M10 3H3v18h18v-7",
+			image: "M3 3h18v18H3z M3 17l6-6 4 4 3-3 5 5 M7 7h.01",
+			video: "M3 5h12v14H3z M15 10l6-4v12l-6-4",
+			document: "M5 2h9l5 5v15H5z M14 2v6h5 M8 12h8 M8 16h8",
+			website:
+				"M2 12h20 M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20 M12 2c6 6 6 14 0 20-6-6-6-14 0-20",
+			link: "m10 14 4-4 M8 16l-1 1a4 4 0 0 1-6-6l5-5a4 4 0 0 1 6 0 M16 8l1-1a4 4 0 0 1 6 6l-5 5a4 4 0 0 1-6 0",
+			other: "M5 2h9l5 5v15H5z M14 2v6h5",
+		};
+		return h(
+			"svg",
+			{
+				width: size,
+				height: size,
+				viewBox: "0 0 24 24",
+				fill: "none",
+				stroke: "currentColor",
+				strokeWidth: 1.5,
+				strokeLinecap: "round",
+				strokeLinejoin: "round",
+				"aria-hidden": true,
+				style: { flexShrink: 0 },
+			},
+			h("path", { d: paths[type] || paths.other }),
+		);
+	}
+	function useWidth() {
+		const ref = R.useRef(null),
+			[width, setWidth] = R.useState(0);
+		R.useEffect(() => {
+			const node = ref.current;
+			if (!node) return;
+			const measure = () => setWidth(node.getBoundingClientRect().width);
+			measure();
+			const observer = new ResizeObserver(measure);
+			observer.observe(node);
+			return () => observer.disconnect();
+		}, []);
+		return [ref, width];
+	}
+	function Preview({ entry, session }) {
+		const ref = R.useRef(null),
+			[visible, setVisible] = R.useState(false);
+		const [failedSource, setFailedSource] = R.useState("");
+		R.useEffect(() => {
+			const observer = new IntersectionObserver(
+				([item]) => {
+					if (item?.isIntersecting) {
+						setVisible(true);
+						observer.disconnect();
+					}
+				},
+				{ rootMargin: "120px" },
+			);
+			if (ref.current) observer.observe(ref.current);
+			return () => observer.disconnect();
+		}, []);
+		const thumbnail =
+			entry.category === "image"
+				? session.media(entry.attachment?.previewUrl || entry.url, "small")
+				: entry.attachment?.previewUrl
+					? session.media(entry.attachment.previewUrl)
+					: undefined;
+		const textual =
+			entry.attachment &&
+			/\.(md|markdown|txt|json|[cm]?[jt]sx?|py|rs|html?|css|ya?ml|sh|go|java|sql|csv)$/i.test(
+				entry.name,
+			);
+		return h(
+			"div",
+			{
+				ref,
+				style: {
+					height: "14rem",
+					width: "100%",
+					position: "relative",
+					overflow: "hidden",
+					textAlign: "start",
+					background: "var(--surface-inset)",
+					borderTop: "1px solid var(--border-primary)",
+					borderRadius:
+						"0 0 var(--radius-control, 8px) var(--radius-control, 8px)",
+					pointerEvents: "none",
+				},
+			},
+			visible && thumbnail && thumbnail !== failedSource
+				? h("img", {
+						src: thumbnail,
+						alt: "",
+						loading: "lazy",
+						decoding: "async",
+						onError: () => setFailedSource(thumbnail),
+						style: {
+							width: "100%",
+							height: "100%",
+							objectFit: "cover",
+							objectPosition: "top",
+							display: "block",
+						},
+					})
+				: visible && textual
+					? h(
+							"div",
+							{
+								style: {
+									padding: "var(--space-4, 16px)",
+									overflowWrap: "anywhere",
+								},
+							},
+							h(TextPreview, {
+								source: session.media(entry.url),
+								name: entry.name,
+								compact: true,
+							}),
+						)
+					: h(
+							"div",
+							{
+								style: {
+									height: "100%",
+									display: "flex",
+									flexDirection: "column",
+									alignItems: "center",
+									justifyContent: "center",
+									padding: 16,
+									gap: 12,
+									textAlign: "center",
+									color: "var(--text-subtle)",
+									overflowWrap: "anywhere",
+								},
+							},
+							h(Icon, { type: entry.category, size: 32 }),
+							h("span", null, entry.name),
+							!entry.attachment &&
+								h(
+									"span",
+									{ style: { fontSize: "0.875em" } },
+									new URL(entry.url).hostname,
+								),
+						),
+			entry.category === "video" &&
+				h(
+					"span",
+					{
+						style: {
+							position: "absolute",
+							top: "50%",
+							left: "50%",
+							transform: "translate(-50%, -50%)",
+							padding: "8px 16px",
+							borderRadius: "var(--radius-pill, 24px)",
+							background: "var(--surface-inverse)",
+							color: "var(--text-inverse)",
+						},
+					},
+					"播放",
+				),
+		);
+	}
+	function ItemActions({ item, starred, star, openMessage }) {
+		return h(
+			"details",
+			{
+				style: { position: "relative", flexShrink: 0 },
+				onBlur: (event) => {
+					if (!event.currentTarget.contains(event.relatedTarget))
+						event.currentTarget.open = false;
+				},
+				onKeyDown: (event) => {
+					if (event.key === "Escape") {
+						event.preventDefault();
+						event.currentTarget.open = false;
+						event.currentTarget.querySelector("summary").focus();
+					}
+				},
+			},
+			h(
+				"summary",
+				{
+					"aria-label": `${item.name} 操作`,
+					title: `${item.name} 操作`,
+					style: {
+						...selectedStyle(false),
+						display: "flex",
+						alignItems: "center",
+						justifyContent: "center",
+						cursor: "pointer",
+						listStyle: "none",
+					},
+				},
+				h(Icon, { type: "more" }),
+			),
+			h(
+				"div",
+				{
+					style: {
+						position: "absolute",
+						right: 0,
+						top: "100%",
+						zIndex: 3,
+						background: "var(--surface-panel)",
+						border: "1px solid var(--border-primary)",
+						borderRadius: "var(--radius-control, 8px)",
+						padding: 4,
+						minWidth: "10rem",
+						display: "flex",
+						flexDirection: "column",
+					},
+				},
+				button(
+					starred ? "取消收藏" : "收藏",
+					(event) => {
+						star(item);
+						event.currentTarget.closest("details").open = false;
+					},
+					{ style: { ...selectedStyle(false), textAlign: "start" } },
+				),
+				button(
+					"回到原消息",
+					(event) => {
+						openMessage(item);
+						event.currentTarget.closest("details").open = false;
+					},
+					{ style: { ...selectedStyle(false), textAlign: "start" } },
+				),
+			),
+		);
+	}
 	function Launcher({ context, available, pressed, toggle }) {
 		return button(
 			"产物",
@@ -439,7 +713,121 @@ export function apply(ctx) {
 			{ "aria-label": "聊天产物", "aria-expanded": pressed, title: "聊天产物" },
 		);
 	}
-	function TextPreview({ source }) {
+	function Markdown({ text }) {
+		// Bounded, inert document presentation: no HTML, image loads or active links.
+		const inline = (value) =>
+			value.split(/(`[^`]+`|\*\*[^*]+\*\*)/g).map((part, i) =>
+				part.startsWith("**")
+					? h("strong", { key: i }, part.slice(2, -2))
+					: part.startsWith("`")
+						? h(
+								"code",
+								{
+									key: i,
+									style: {
+										background: "var(--surface-inset)",
+										padding: "0 4px",
+									},
+								},
+								part.slice(1, -1),
+							)
+						: part,
+			);
+		const nodes = [],
+			lines = text.split("\n");
+		for (let i = 0; i < lines.length; i++) {
+			const line = lines[i],
+				heading = /^(#{1,6})\s+(.+)$/.exec(line);
+			if (/^\s*```/.test(line)) {
+				const code = [];
+				while (++i < lines.length && !/^\s*```/.test(lines[i]))
+					code.push(lines[i]);
+				nodes.push(
+					h(
+						"pre",
+						{
+							key: i,
+							style: {
+								margin: "12px 0",
+								padding: 16,
+								background: "var(--surface-inset)",
+								overflowX: "auto",
+								whiteSpace: "pre-wrap",
+								fontSize: "0.875em",
+							},
+						},
+						code.join("\n"),
+					),
+				);
+			} else if (heading) {
+				nodes.push(
+					h(
+						`h${heading[1].length}`,
+						{
+							key: i,
+							style: {
+								margin: "20px 0 12px",
+								fontSize:
+									heading[1].length === 1
+										? "1.5em"
+										: heading[1].length === 2
+											? "1.25em"
+											: "1em",
+								fontWeight: 600,
+								paddingBottom: 8,
+								borderBottom:
+									heading[1].length <= 2
+										? "1px solid var(--border-primary)"
+										: undefined,
+							},
+						},
+						inline(heading[2]),
+					),
+				);
+			} else if (/^\s*[-*+]\s+/.test(line) || /^\s*\d+\.\s+/.test(line)) {
+				const ordered = /^\s*\d+\./.test(line),
+					items = [],
+					pattern = ordered ? /^\s*\d+\.\s+/ : /^\s*[-*+]\s+/;
+				do {
+					items.push(
+						h(
+							"li",
+							{ key: i, style: { margin: "4px 0" } },
+							inline(lines[i].replace(pattern, "")),
+						),
+					);
+					i++;
+				} while (i < lines.length && pattern.test(lines[i]));
+				i--;
+				nodes.push(
+					h(
+						ordered ? "ol" : "ul",
+						{
+							key: `list-${i}`,
+							style: { margin: "12px 0", paddingInlineStart: 24 },
+						},
+						...items,
+					),
+				);
+			} else if (line.trim())
+				nodes.push(
+					h("p", { key: i, style: { margin: "12px 0" } }, inline(line)),
+				);
+		}
+		return h(
+			"div",
+			{
+				style: {
+					maxWidth: "52rem",
+					marginInline: "auto",
+					lineHeight: 1.6,
+					overflowWrap: "anywhere",
+				},
+			},
+			...nodes,
+		);
+	}
+	function TextPreview({ source, name = "", compact = false }) {
 		const [data, setData] = R.useState({ pending: true });
 		const [retry, setRetry] = R.useState(0);
 		R.useEffect(() => {
@@ -455,6 +843,7 @@ export function apply(ctx) {
 			return () => controller.abort();
 		}, [source, retry]);
 		if (data.pending) return note("正在读取文档…");
+		if (data.error && compact) return note("打开查看文档或来源消息");
 		if (data.error)
 			return h(
 				"div",
@@ -465,19 +854,23 @@ export function apply(ctx) {
 		return h(
 			"div",
 			null,
-			data.truncated && note("显示前 64 KiB，完整文件请从来源消息打开"),
-			h(
-				"pre",
-				{
-					style: {
-						whiteSpace: "pre-wrap",
-						overflowWrap: "anywhere",
-						font: "inherit",
-						margin: 0,
-					},
-				},
-				data.text,
-			),
+			!compact &&
+				data.truncated &&
+				note("显示前 64 KiB，完整文件请从来源消息打开"),
+			/\.(md|markdown)$/i.test(name)
+				? h(Markdown, { text: data.text })
+				: h(
+						"pre",
+						{
+							style: {
+								whiteSpace: "pre-wrap",
+								overflowWrap: "anywhere",
+								font: "inherit",
+								margin: 0,
+							},
+						},
+						data.text,
+					),
 		);
 	}
 	function Detail({ entry, connection, channelContext, context }) {
@@ -486,7 +879,7 @@ export function apply(ctx) {
 		const source = entry.attachment ? session.media(entry.url) : undefined;
 		const textual =
 			entry.attachment &&
-			/\.(md|txt|json|[cm]?[jt]sx?|py|rs|html?|css|ya?ml|sh|go|java|sql|csv)$/i.test(
+			/\.(md|markdown|txt|json|[cm]?[jt]sx?|py|rs|html?|css|ya?ml|sh|go|java|sql|csv)$/i.test(
 				entry.name,
 			);
 		const openMessage = () => {
@@ -523,7 +916,9 @@ export function apply(ctx) {
 					else openMessage();
 				}),
 			),
-			textual && source && h(TextPreview, { key: entry.id, source }),
+			textual &&
+				source &&
+				h(TextPreview, { key: entry.id, source, name: entry.name }),
 			h("h4", null, "来源内容"),
 			h(
 				ctx.conversation.ui.Conversation,
@@ -578,9 +973,42 @@ export function apply(ctx) {
 			session.profiles.snapshot,
 		);
 		const [category, setCategory] = R.useState("all"),
-			[scope, setScope] = R.useState("all"),
+			[scope, setScope] = R.useState("agent"),
 			[query, setQuery] = R.useState(""),
+			[layout, setLayout] = R.useState("grid"),
+			[starredOnly, setStarredOnly] = R.useState(false),
 			[selected, setSelected] = R.useState("");
+		const [root, width] = useWidth();
+		const scroller = R.useRef(null),
+			lastScroll = R.useRef(0),
+			lastTrigger = R.useRef(null);
+		const inspect = (item, event) => {
+			lastScroll.current = scroller.current?.scrollTop || 0;
+			lastTrigger.current = event.currentTarget;
+			setSelected(item.id);
+		};
+		R.useLayoutEffect(() => {
+			if (scroller.current)
+				scroller.current.scrollTop = selected ? 0 : lastScroll.current;
+			if (!selected && lastTrigger.current?.isConnected)
+				lastTrigger.current.focus({ preventScroll: true });
+		}, [selected]);
+		const storageKey = bookmarkKey(
+			connection.scope,
+			session.viewer,
+			channelContext.channelId,
+		);
+		const storage = () => {
+			try {
+				return globalThis.localStorage;
+			} catch {
+				return undefined;
+			}
+		};
+		const [stars, setStars] = R.useState(() =>
+			readBookmarks(storage(), storageKey),
+		);
+		const [saveError, setSaveError] = R.useState(false);
 		const entries = R.useMemo(
 			() => artifactsFrom(data.rows, profiles),
 			[data.rows, profiles],
@@ -590,111 +1018,291 @@ export function apply(ctx) {
 				(category === "all" || category === e.category) &&
 				(scope !== "agent" || e.agent) &&
 				(scope !== "files" || e.attachment) &&
+				(!starredOnly || stars.includes(e.id)) &&
 				e.name.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase()),
 		);
 		const entry = entries.find((e) => e.id === selected);
 		const reset = () => {
 			setCategory("all");
-			setScope("all");
+			setStarredOnly(false);
 			setQuery("");
 		};
+		const star = (item) => {
+			const next = stars.includes(item.id)
+				? stars.filter((id) => id !== item.id)
+				: [...stars, item.id];
+			setStars(next);
+			setSaveError(!saveBookmarks(storage(), storageKey, next));
+		};
+		const openMessage = (item) => {
+			const current = ctx.relay.snapshot();
+			if (
+				!canRead(current, channelContext.channelId) ||
+				current.session !== session
+			)
+				return;
+			const separator = connection.scope.lastIndexOf(":");
+			void ctx.navigation.open({
+				version: 1,
+				kind: "conversation",
+				scope: {
+					communityOrigin: connection.scope.slice(0, separator),
+					viewer: session.viewer,
+				},
+				channelId: channelContext.channelId,
+				messageId: item.message.id,
+			});
+		};
+		const pageAction = (method) => {
+			setSelected("");
+			void store[method]();
+		};
+		const fieldStyle = {
+			...rowStyle,
+			border: 0,
+			margin: 0,
+			padding: 0,
+			gap: "var(--space-1, 4px)",
+		};
+		const collectionId = R.useId();
+		const collections = [
+			["agent", "Agent 产物"],
+			["files", "已分享文件"],
+			["all", "全部文件"],
+		];
+		const scopeTabs = collections.map(([value, label], index) =>
+			button(
+				label,
+				() => {
+					setScope(value);
+					setSelected("");
+				},
+				{
+					key: value,
+					id: `${collectionId}-${value}`,
+					role: "tab",
+					"aria-selected": scope === value,
+					"aria-controls": `${collectionId}-content`,
+					tabIndex: scope === value ? 0 : -1,
+					onKeyDown: (event) => {
+						if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key))
+							return;
+						event.preventDefault();
+						const next =
+							event.key === "Home"
+								? 0
+								: event.key === "End"
+									? collections.length - 1
+									: (index +
+											(event.key === "ArrowRight" ? 1 : -1) +
+											collections.length) %
+										collections.length;
+						setScope(collections[next][0]);
+						setSelected("");
+						event.currentTarget.parentElement
+							.querySelectorAll('[role="tab"]')
+							[next].focus();
+					},
+					style: {
+						...selectedStyle(scope === value),
+						whiteSpace: "nowrap",
+						borderRadius: 0,
+						borderBottom:
+							scope === value
+								? "2px solid var(--text-standard)"
+								: "2px solid transparent",
+						padding: "12px 8px",
+						background: "transparent",
+					},
+				},
+			),
+		);
+		const controls = h(
+			"div",
+			{
+				style: {
+					...rowStyle,
+					justifyContent: "space-between",
+					gap: 12,
+					padding: width <= 576 ? "16px 12px" : "16px 20px",
+				},
+			},
+			h(
+				"fieldset",
+				{ "aria-label": "产物类型", style: fieldStyle },
+				...Object.entries(labels).map(([value, label]) =>
+					button(label, () => setCategory(value), {
+						key: value,
+						"aria-pressed": category === value,
+						style: selectedStyle(category === value),
+					}),
+				),
+			),
+			h(
+				"div",
+				{
+					style: {
+						...rowStyle,
+						gap: 12,
+						width: width <= 1040 ? "100%" : undefined,
+					},
+				},
+				h("input", {
+					type: "search",
+					"aria-label": "搜索文件名（本页）",
+					placeholder: "搜索文件名",
+					value: query,
+					onChange: (e) => setQuery(e.target.value),
+					style: {
+						width: "15rem",
+						maxWidth: "100%",
+						minWidth: "min(100%, 8rem)",
+						flex: width <= 1040 ? "1 1 8rem" : undefined,
+					},
+				}),
+				button(h(Icon, { type: "star" }), () => setStarredOnly(!starredOnly), {
+					"aria-label": "仅看收藏",
+					title: "仅看收藏",
+					"aria-pressed": starredOnly,
+					style: {
+						...selectedStyle(starredOnly),
+						display: "flex",
+						alignItems: "center",
+						justifyContent: "center",
+					},
+				}),
+				h(
+					"fieldset",
+					{
+						"aria-label": "显示方式",
+						style: {
+							...fieldStyle,
+							background: "var(--surface-inset)",
+							borderRadius: "var(--radius-control, 8px)",
+							flexWrap: "nowrap",
+						},
+					},
+					...[
+						["grid", "卡片视图"],
+						["list", "列表视图"],
+					].map(([value, label]) =>
+						button(h(Icon, { type: value }), () => setLayout(value), {
+							key: value,
+							"aria-label": label,
+							title: label,
+							"aria-pressed": layout === value,
+							style: {
+								...selectedStyle(layout === value),
+								display: "flex",
+								alignItems: "center",
+								justifyContent: "center",
+							},
+						}),
+					),
+				),
+				button("刷新", () => pageAction("refresh"), {
+					disabled: data.pending,
+					style: selectedStyle(false),
+				}),
+			),
+		);
 		return h(
 			"section",
 			{
-				"aria-label": "聊天产物",
+				ref: root,
+				"aria-label": "产物看板",
 				style: {
 					display: "flex",
 					flexDirection: "column",
+					minWidth: 0,
 					minHeight: 0,
 					height: "100%",
-					padding: inset,
-					gap,
+					color: "var(--text-standard)",
 					boxSizing: "border-box",
 				},
 			},
 			h(
 				"div",
-				{ style: rowStyle },
-				h("input", {
-					type: "search",
-					"aria-label": "搜索本页产物",
-					placeholder: "搜索本页产物",
-					value: query,
-					onChange: (e) => setQuery(e.target.value),
-					style: { flex: "1 1 10rem", minWidth: 0, width: "100%" },
-				}),
-				h(
-					"select",
-					{
-						"aria-label": "产物类型",
-						value: category,
-						onChange: (e) => setCategory(e.target.value),
+				{
+					role: "tablist",
+					"aria-label": "产物范围",
+					style: {
+						...rowStyle,
+						flexWrap: "nowrap",
+						padding: "0 12px",
+						borderBottom: "1px solid var(--border-primary)",
+						overflowX: "auto",
+						flexShrink: 0,
 					},
-					Object.entries(labels).map(([value, label]) =>
-						h("option", { key: value, value }, label),
-					),
-				),
-				h(
-					"select",
-					{
-						"aria-label": "产物范围",
-						value: scope,
-						onChange: (e) => setScope(e.target.value),
-					},
-					[
-						["all", "所有产物"],
-						["agent", "Agent 产物"],
-						["files", "共享文件"],
-					].map(([value, label]) => h("option", { key: value, value }, label)),
-				),
-				button(
-					"刷新",
-					() => {
-						setSelected("");
-						void store.refresh();
-					},
-					{ disabled: data.pending },
-				),
+				},
+				...scopeTabs,
 			),
-			h(
-				"div",
-				{ style: rowStyle },
-				note(
-					`第 ${data.page} 页 · ${data.scanned} 条消息 · ${entries.length} 项产物（含线程回复）`,
-				),
-				data.changed &&
-					button(
-						"有新消息，回到最新",
-						() => {
-							setSelected("");
-							void store.refresh();
-						},
-						{ disabled: data.pending },
-					),
-			),
-			data.error &&
-				h(
-					"div",
-					{ role: "alert" },
-					data.error,
-					" ",
-					button(
-						"重试本页",
-						() => {
-							void store.retry();
-						},
-						{ disabled: data.pending },
-					),
-				),
 			h(
 				"div",
 				{
-					style: { overflowY: "auto", minHeight: 0, flex: "1 1 auto" },
-					"aria-busy": data.pending,
+					id: `${collectionId}-content`,
+					role: "tabpanel",
+					"aria-labelledby": `${collectionId}-${scope}`,
+					style: {
+						display: "flex",
+						flexDirection: "column",
+						minHeight: 0,
+						flex: 1,
+					},
 				},
-				data.pending && note("正在读取当前聊天的产物…"),
-				entry
-					? h(
+				controls,
+				h(
+					"div",
+					{
+						style: {
+							...rowStyle,
+							justifyContent: "space-between",
+							padding: "0 20px 12px",
+							color: "var(--text-subtle)",
+							fontSize: "0.875em",
+						},
+					},
+					h(
+						"span",
+						{ role: "status" },
+						`第 ${data.page} 页 · ${data.scanned} 条消息 · ${shown.length} 项产物`,
+					),
+					data.changed &&
+						button("有新消息，回到最新", () => pageAction("refresh"), {
+							disabled: data.pending,
+						}),
+				),
+				data.error &&
+					h(
+						"div",
+						{ role: "alert", style: { padding: "8px 20px" } },
+						data.error,
+						" ",
+						button("重试本页", () => pageAction("retry"), {
+							disabled: data.pending,
+						}),
+					),
+				saveError &&
+					h(
+						"p",
+						{ role: "alert", style: { paddingInline: 20 } },
+						"收藏未能保存到本机",
+					),
+				h(
+					"div",
+					{
+						ref: scroller,
+						"aria-busy": data.pending,
+						style: {
+							overflowY: "auto",
+							minHeight: 0,
+							flex: "1 1 auto",
+							padding: width <= 576 ? "0 12px 20px" : "0 20px 20px",
+						},
+					},
+					data.pending && note("正在读取当前聊天的产物…"),
+					entry &&
+						h(
 							"div",
 							null,
 							button("返回产物列表", () => setSelected("")),
@@ -705,95 +1313,154 @@ export function apply(ctx) {
 								channelContext,
 								context,
 							}),
-						)
-					: h(
-							"div",
-							{
-								style: {
-									display: "grid",
-									gridTemplateColumns:
-										"repeat(auto-fit, minmax(min(100%, 14rem), 1fr))",
-									gap,
-								},
+						),
+					h(
+						"ul",
+						{
+							"aria-label": "产物列表",
+							hidden: !!entry,
+							style: {
+								margin: 0,
+								padding: 0,
+								listStyle: "none",
+								display: entry ? "none" : "grid",
+								gap: 16,
+								gridTemplateColumns:
+									layout === "list"
+										? "minmax(0, 1fr)"
+										: `repeat(${width > 1040 ? 3 : width > 576 ? 2 : 1}, minmax(0, 1fr))`,
 							},
-							...shown.map((e) =>
-								h(
-									"article",
-									{
-										className: "ui-card",
-										key: e.id,
-										style: {
-											minWidth: 0,
-											padding: inset,
-											overflowWrap: "anywhere",
-										},
+						},
+						...shown.map((item) =>
+							h(
+								"li",
+								{
+									key: item.id,
+									style: {
+										minWidth: 0,
+										border: "1px solid var(--border-primary)",
+										borderRadius: "var(--radius-control, 8px)",
+										background: "var(--surface-panel)",
 									},
-									e.category === "image" &&
-										h("img", {
-											src: session.media(e.url, "small"),
-											alt: e.name,
-											loading: "lazy",
-											style: {
-												width: "100%",
-												height: "8rem",
-												objectFit: "contain",
-											},
-										}),
-									h(
-										"p",
-										{ style: { color: "var(--text-subtle)" } },
-										labels[e.category],
-									),
-									button(e.name, () => setSelected(e.id), {
-										style: {
-											maxWidth: "100%",
-											whiteSpace: "normal",
-											textAlign: "start",
-											overflowWrap: "anywhere",
-										},
-									}),
-									h(
-										"p",
-										{ style: { color: "var(--text-subtle)" } },
-										`${profiles.get(e.message.authorId)?.name || e.message.authorId.slice(0, 8)} · ${new Date(e.message.createdAt * 1000).toLocaleDateString()}`,
-									),
-								),
-							),
-							!data.pending &&
-								!data.error &&
-								shown.length === 0 &&
+								},
 								h(
 									"div",
-									null,
-									note(
-										entries.length
-											? "本页没有匹配的产物"
-											: "本页消息没有产物，可继续查看更早消息",
+									{
+										style: {
+											display: "flex",
+											alignItems: "center",
+											gap: 8,
+											padding: 12,
+											minWidth: 0,
+										},
+									},
+									h(Icon, { type: item.category }),
+									button(
+										h(
+											"span",
+											{
+												style: {
+													display: "block",
+													overflow: "hidden",
+													textOverflow: "ellipsis",
+													whiteSpace: "nowrap",
+												},
+											},
+											item.name,
+										),
+										(event) => inspect(item, event),
+										{
+											title: item.name,
+											style: {
+												...selectedStyle(false),
+												color: "var(--text-standard)",
+												textAlign: "start",
+												flex: 1,
+												minWidth: 0,
+												overflow: "hidden",
+												padding: 0,
+											},
+										},
 									),
-									button("清除筛选", reset),
+									h(ItemActions, {
+										item,
+										starred: stars.includes(item.id),
+										star,
+										openMessage,
+									}),
 								),
+								layout === "grid" &&
+									button(
+										h(Preview, { entry: item, session }),
+										(event) => inspect(item, event),
+										{
+											"aria-label": `查看 ${item.name}`,
+											style: {
+												display: "block",
+												width: "100%",
+												border: 0,
+												padding: 0,
+												borderRadius:
+													"0 0 var(--radius-control, 8px) var(--radius-control, 8px)",
+												background: "transparent",
+												textAlign: "start",
+											},
+										},
+									),
+							),
 						),
-			),
-			h(
-				"div",
-				{ style: rowStyle },
-				button(
-					"上一页",
-					() => {
-						setSelected("");
-						void store.previous();
-					},
-					{ disabled: data.pending || data.page === 1 },
+						!data.pending &&
+							!data.error &&
+							shown.length === 0 &&
+							h(
+								"li",
+								{
+									style: {
+										gridColumn: "1 / -1",
+										display: "flex",
+										flexDirection: "column",
+										alignItems: "center",
+										justifyContent: "center",
+										minHeight: "14rem",
+										gap: 12,
+										color: "var(--text-subtle)",
+									},
+								},
+								h(Icon, { type: "grid", size: 24 }),
+								note(entries.length ? "没有匹配的产物" : "本页暂无产物"),
+								(query || category !== "all" || starredOnly) &&
+									button("清除筛选", reset),
+							),
+					),
+					h(
+						"div",
+						{
+							style: {
+								...rowStyle,
+								justifyContent: "center",
+								padding: "16px 0",
+							},
+						},
+						button("上一页", () => pageAction("previous"), {
+							disabled: data.pending || data.page === 1,
+						}),
+						button("加载更早产物", () => pageAction("next"), {
+							disabled: data.pending || !data.more,
+						}),
+					),
+					h(
+						"p",
+						{
+							style: {
+								margin: "0",
+								color: "var(--text-subtle)",
+								fontSize: "0.875em",
+								textAlign: "center",
+							},
+						},
+						"包含线程回复 · 搜索与筛选作用于本页",
+					),
 				),
-				button(
-					"查看更早消息",
-					() => {
-						setSelected("");
-						void store.next();
-					},
-					{ disabled: data.pending || !data.more },
-				),
-				note("仅显示当前已发布消息；搜索作用于本页"),
 			),
 		);
 	}

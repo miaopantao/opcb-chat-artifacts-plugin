@@ -3,13 +3,70 @@ import { test } from "node:test";
 import {
 	apply,
 	artifactsFrom,
+	bookmarkKey,
 	canRead,
 	createReader,
 	inject,
 	linksIn,
+	readBookmarks,
 	readText,
 	safeUrl,
+	saveBookmarks,
 } from "../plugin.js";
+
+test("bookmarks are isolated by community, account and channel and survive reload", () => {
+	const values = new Map(),
+		storage = {
+			getItem: (key) => values.get(key),
+			setItem: (key, value) => values.set(key, value),
+		};
+	const key = bookmarkKey("community-a", "viewer-a", "channel-a");
+	assert.equal(saveBookmarks(storage, key, ["message:artifact"]), true);
+	assert.deepEqual(readBookmarks(storage, key), ["message:artifact"]);
+	for (const other of [
+		bookmarkKey("community-b", "viewer-a", "channel-a"),
+		bookmarkKey("community-a", "viewer-b", "channel-a"),
+		bookmarkKey("community-a", "viewer-a", "channel-b"),
+	])
+		assert.deepEqual(readBookmarks(storage, other), []);
+	assert.deepEqual([...values.keys()], [key]);
+});
+
+test("corrupt or unavailable bookmark storage never breaks the collection", () => {
+	assert.deepEqual(
+		readBookmarks({ getItem: () => "broken JSON" }, "own-key"),
+		[],
+	);
+	assert.deepEqual(
+		readBookmarks({ getItem: () => '[null,42,"one","one"]' }, "own-key"),
+		["one"],
+	);
+	assert.equal(saveBookmarks(undefined, "own-key", []), false);
+	assert.equal(
+		saveBookmarks(
+			{
+				setItem() {
+					throw new Error("quota");
+				},
+			},
+			"own-key",
+			[],
+		),
+		false,
+	);
+	assert.equal(
+		saveBookmarks(
+			{
+				setItem() {
+					assert.fail("oversize writes must not happen");
+				},
+			},
+			"own-key",
+			Array(1001).fill("one"),
+		),
+		false,
+	);
+});
 
 const id = (n) => n.toString(16).padStart(64, "0");
 const channelId = "00000000-0000-4000-8000-000000000001";
