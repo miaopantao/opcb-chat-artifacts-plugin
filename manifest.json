@@ -1,0 +1,10 @@
+{
+	"id": "opcb.chat-artifacts",
+	"name": "聊天产物",
+	"apiVersion": 1,
+	"description": "在当前聊天查看文件、图片、视频和链接，搜索分类并回到来源消息。独立于 Buzz 客户端更新。",
+	"discovery": {
+		"category": "productivity",
+		"tags": ["artifacts", "files", "chat"]
+	}
+}
