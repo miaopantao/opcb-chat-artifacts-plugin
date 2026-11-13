@@ -706,7 +706,7 @@ export function apply(ctx) {
 	}
 	function Launcher({ context, available, pressed, toggle }) {
 		return button(
-			"产物",
+			h(R.Fragment, null, h("img", {src: "data:image/svg+xml;base64,PHN2ZwogIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyIKICB3aWR0aD0iMjQiCiAgaGVpZ2h0PSIyNCIKICB2aWV3Qm94PSIwIDAgMjQgMjQiCiAgZmlsbD0ibm9uZSIKICBzdHJva2U9IiMyNjM0NDkiCiAgc3Ryb2tlLXdpZHRoPSIxLjgiCiAgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIgogIHN0cm9rZS1saW5lam9pbj0icm91bmQiCiAgY2xhc3M9Imljb24gaWNvbi10YWJsZXIgaWNvbnMtdGFibGVyLW91dGxpbmUgaWNvbi10YWJsZXItZmlsZXMiCj48cmVjdCB4PSIwIiB5PSIwIiB3aWR0aD0iMjQiIGhlaWdodD0iMjQiIHJ4PSI1IiBmaWxsPSIjZjFmNGY4IiBzdHJva2U9Im5vbmUiLz4KICA8cGF0aCBzdHJva2U9Im5vbmUiIGQ9Ik0wIDBoMjR2MjRIMHoiIGZpbGw9Im5vbmUiIC8+CiAgPHBhdGggZD0iTTE1IDN2NGExIDEgMCAwIDAgMSAxaDQiIC8+CiAgPHBhdGggZD0iTTE4IDE3aC03YTIgMiAwIDAgMSAtMiAtMnYtMTBhMiAyIDAgMCAxIDIgLTJoNGw1IDV2N2EyIDIgMCAwIDEgLTIgMiIgLz4KICA8cGF0aCBkPSJNMTYgMTd2MmEyIDIgMCAwIDEgLTIgMmgtN2EyIDIgMCAwIDEgLTIgLTJ2LTEwYTIgMiAwIDAgMSAyIC0yaDIiIC8+Cjwvc3ZnPg==", alt: "", "aria-hidden": true, width: 18, height: 18}), "产物"),
 			() => {
 				if (available()) toggle(prefix + context.channelId);
 			},
