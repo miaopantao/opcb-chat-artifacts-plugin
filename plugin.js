@@ -121,166 +121,470 @@ export function canRead(connection, channelId) {
 	);
 }
 
-// Discovery obtains IDs/cursors only. The host's exact reader folds edits,
-// deletions, attribution and attachments. Never reimplement those semantics.
-// Twelve disposable readers keep one page bounded, including thread replies.
-export function createReader(relay, connection, channelId, pageSize = 12) {
-	const { session } = connection;
+// A local materialized index, never an authority source. The host still folds
+// edits/deletions and confirms current channel access before any cache is shown.
+export function cacheScope(connection, channelId) {
+	return JSON.stringify([
+		connection.scope,
+		connection.session.viewer,
+		channelId,
+	]);
+}
+export function createLocalCache(factory = globalThis.indexedDB) {
+	let opening,
+		active,
+		closed = false;
+	const database = () => {
+		if (closed) return Promise.reject(new Error("Local cache closed"));
+		if (!opening)
+			opening = new Promise((resolve, reject) => {
+				if (!factory) return reject(new Error("Local cache unavailable"));
+				const request = factory.open("opcb.chat-artifacts.cache.v1", 1);
+				request.onupgradeneeded = () =>
+					request.result.createObjectStore("entries", { keyPath: "key" });
+				request.onerror = () => reject(request.error);
+				request.onblocked = () => reject(new Error("Local cache locked"));
+				request.onsuccess = () => {
+					const db = request.result;
+					if (closed) {
+						db.close();
+						reject(new Error("Local cache closed"));
+						return;
+					}
+					active = db;
+					db.onversionchange = () => {
+						db.close();
+						opening = undefined;
+					};
+					resolve(db);
+				};
+			});
+		return opening;
+	};
+	const transaction = async (mode, run) => {
+		const db = await database();
+		return new Promise((resolve, reject) => {
+			const tx = db.transaction("entries", mode),
+				store = tx.objectStore("entries");
+			let result;
+			tx.oncomplete = () => resolve(result);
+			tx.onabort = tx.onerror = () =>
+				reject(tx.error || new Error("Local cache failed"));
+			try {
+				run(store, (value) => {
+					result = value;
+				});
+			} catch (error) {
+				tx.abort();
+				reject(error);
+			}
+		});
+	};
+	return {
+		close() {
+			closed = true;
+			active?.close();
+		},
+		async load(scope) {
+			return transaction("readonly", (store, done) => {
+				const result = { records: [], meta: undefined };
+				const rows = store.getAll(
+					IDBKeyRange.bound([scope, "row", ""], [scope, "row", "\uffff"]),
+				);
+				const meta = store.get([scope, "meta", "index"]);
+				rows.onsuccess = () => {
+					result.records = rows.result.map((item) => item.value);
+				};
+				meta.onsuccess = () => {
+					result.meta = meta.result?.value;
+				};
+				done(result);
+			});
+		},
+		async commit(scope, records, meta) {
+			return transaction("readwrite", (store) => {
+				for (const record of records)
+					store.put({ key: [scope, "row", record.id], value: record });
+				store.put({ key: [scope, "meta", "index"], value: meta });
+			});
+		},
+		async text(scope, source, value) {
+			return transaction(
+				value === undefined ? "readonly" : "readwrite",
+				(store, done) => {
+					const key = [scope, "text", source];
+					if (value !== undefined) store.put({ key, value });
+					else {
+						const request = store.get(key);
+						request.onsuccess = () => done(request.result?.value);
+					}
+				},
+			);
+		},
+		async clear(scope) {
+			return transaction("readwrite", (store) => {
+				store.delete(IDBKeyRange.bound([scope, ""], [scope, "\uffff"]));
+			});
+		},
+	};
+}
+
+const CHANGE_KINDS = [9, 40002, 40003, 5, 9005, 39005];
+const validId = (id) => typeof id === "string" && /^[0-9a-f]{64}$/.test(id);
+const sortedEvents = (events) =>
+	[...events].sort(
+		(a, b) => b.created_at - a.created_at || a.id.localeCompare(b.id),
+	);
+
+export function createReader(
+	relay,
+	connection,
+	channelId,
+	pageSize = 12,
+	cache = createLocalCache(),
+) {
+	const { session } = connection,
+		partition = cacheScope(connection, channelId);
 	let disposed = false,
-		epoch = 0,
+		revoked = false,
 		controller,
-		readers = [],
-		stops = [];
-	let pageCursors = [undefined],
-		page = 0,
-		nextCursor,
-		retryIndex = 0,
-		retryHead = false;
+		started = false,
+		queuedLive = false;
+	let meta = {
+		initialized: false,
+		checkpoint: 0,
+		older: undefined,
+		more: true,
+		pages: 0,
+		aliases: {},
+	};
 	let state = {
 		rows: [],
 		pending: false,
-		more: false,
+		more: true,
 		error: "",
-		page: 1,
+		cacheError: "",
 		scanned: 0,
 		changed: false,
+		cached: false,
+		page: 0,
 	};
-	const listeners = new Set();
+	const records = new Map(),
+		dirty = new Map(),
+		watched = new Map(),
+		busyViews = new Set(),
+		textMemory = new Map(),
+		listeners = new Set();
+	let writes = Promise.resolve(),
+		retryMode = "latest";
 	const current = () => {
 		const now = relay.snapshot();
 		return (
 			!disposed &&
+			!revoked &&
 			now.session === session &&
 			now.scope === connection.scope &&
 			now.generation === connection.generation &&
 			canRead(now, channelId)
 		);
 	};
-	const publish = (patch) => {
+	const publish = (patch = {}) => {
 		if (disposed) return;
 		state = { ...state, ...patch };
 		for (const listener of listeners) listener();
 	};
+	const render = () =>
+		publish({
+			rows: [...records.values()]
+				.flatMap((record) => (record.row ? [record.row] : []))
+				.sort((a, b) => b.createdAt - a.createdAt || a.id.localeCompare(b.id)),
+			scanned: records.size,
+		});
+	const closeView = (id) => {
+		const owned = watched.get(id);
+		if (owned) {
+			watched.delete(id);
+			owned.stop();
+			owned.view.dispose();
+		}
+	};
 	const retire = () => {
 		controller?.abort();
 		controller = undefined;
-		for (const stop of stops) stop();
-		stops = [];
-		for (const view of readers) view.dispose();
-		readers = [];
+		for (const id of [...watched.keys()]) closeView(id);
+	};
+	const cacheFailed = () => {
+		if (current())
+			publish({
+				cacheError: "本地缓存保存失败，当前列表仍可用；关闭后可能需要重新同步",
+			});
+	};
+	const persist = async () => {
+		if (!current()) return;
+		const batch = [...dirty.values()];
+		dirty.clear();
+		const checkpoint = structuredClone(meta);
+		writes = writes
+			.catch(() => {})
+			.then(async () => {
+				if (current()) await cache.commit(partition, batch, checkpoint);
+			});
+		try {
+			await writes;
+		} catch {
+			for (const record of batch)
+				if (!dirty.has(record.id)) dirty.set(record.id, record);
+			cacheFailed();
+		}
 	};
 	const revoke = () => {
-		epoch++;
+		if (revoked || disposed) return;
+		revoked = true;
 		retire();
+		records.clear();
+		dirty.clear();
+		textMemory.clear();
 		publish({
 			rows: [],
 			pending: false,
 			more: false,
+			cached: false,
 			error: "连接或阅读权限已变化，请重新打开产物面板",
 		});
+		// Ordered after any already-started writes, so a late write cannot resurrect it.
+		const now = relay.snapshot(),
+			channel = now.session?.channels.get?.(channelId);
+		const denied =
+			now.status === "ready" &&
+			now.scope === connection.scope &&
+			now.session?.viewer === session.viewer &&
+			channel &&
+			!channel.cached &&
+			!channel.metadataCached &&
+			!channel.pending &&
+			!channel.metadataPending &&
+			channel.visibility === "private" &&
+			Array.isArray(channel.members) &&
+			!channel.members.includes(session.viewer);
+		if (denied)
+			writes = writes
+				.catch(() => {})
+				.then(() => cache.clear(partition))
+				.catch(() => {});
 	};
-	const update = () => {
+	const adopt = (id, view) => {
 		if (!current()) return revoke();
-		const snapshots = readers.map((view) => view.snapshot());
-		const rows = snapshots
-			.filter(
-				(s) => s.targetStatus === "ready" && s.target?.channelId === channelId,
+		const value = view.snapshot(),
+			previous = records.get(id);
+		if (value.targetStatus !== "ready" && value.targetStatus !== "unavailable")
+			return;
+		const row =
+			value.targetStatus === "ready" && value.target?.channelId === channelId
+				? value.target
+				: undefined;
+		const record = {
+			id,
+			time: row?.createdAt ?? previous?.time ?? 0,
+			row: row && artifactsFrom([row]).length ? structuredClone(row) : null,
+		};
+		records.set(id, record);
+		dirty.set(id, record);
+		render();
+		if (!state.pending && started) void persist();
+	};
+	const resolveIds = async (ids, signal) => {
+		const queue = [...new Set(ids.filter(validId))];
+		let failures = 0;
+		await Promise.all(
+			Array.from({ length: Math.min(3, queue.length) }, async () => {
+				while (queue.length && current() && !signal.aborted) {
+					const id = queue.shift();
+					let view;
+					busyViews.add(id);
+					try {
+						let owned = watched.get(id);
+						if (!owned) {
+							if (watched.size >= 12) {
+								const candidate = [...watched.keys()].find(
+									(key) => !busyViews.has(key),
+								);
+								if (candidate) closeView(candidate);
+							}
+							view = session.thread(channelId, id, { exact: true });
+							owned = { view, stop: view.subscribe(() => adopt(id, view)) };
+							watched.set(id, owned);
+						} else view = owned.view;
+						await view.refresh();
+						if (!current() || signal.aborted) return;
+						adopt(id, view);
+						if (
+							view.snapshot().targetStatus === "error" ||
+							view.snapshot().targetStatus === "loading"
+						)
+							failures++;
+					} catch {
+						if (current() && !signal.aborted) failures++;
+					} finally {
+						busyViews.delete(id);
+					}
+				}
+			}),
+		);
+		if (failures)
+			throw new Error(`${failures} 条消息读取失败，保留已保存内容，请重试同步`);
+	};
+	const read = async (filter, signal) => {
+		const result = await session.readRemote(
+			[{ "#h": [channelId], limit: pageSize, ...filter }],
+			{ signal, fresh: true },
+		);
+		if (!current() || signal.aborted)
+			throw new DOMException("Stale read", "AbortError");
+		const events = sortedEvents([
+			...new Map(
+				result
+					.filter(
+						(event) =>
+							validId(event.id) &&
+							Number.isSafeInteger(event.created_at) &&
+							event.created_at >= 0 &&
+							event.tags.some(
+								([key, value]) => key === "h" && value === channelId,
+							) &&
+							(filter.kinds || CHANGE_KINDS).includes(event.kind),
+					)
+					.map((event) => [event.id, event]),
+			).values(),
+		]);
+		if (
+			events.length > pageSize ||
+			events.some(
+				(event) =>
+					(filter.since !== undefined && event.created_at < filter.since) ||
+					(filter.until !== undefined &&
+						(event.created_at > filter.until ||
+							(event.created_at === filter.until &&
+								event.id <= filter.before_id))),
 			)
-			.map((s) => s.target);
-		publish({
-			rows: rows.sort(
-				(a, b) => b.createdAt - a.createdAt || a.id.localeCompare(b.id),
-			),
-		});
+		)
+			throw new Error("历史分页游标不兼容");
+		return events;
 	};
-	async function load(index = page, head = false) {
-		if (disposed || state.pending) return;
-		if (!current()) return revoke();
-		retryIndex = index;
-		retryHead = head;
-		const ownedEpoch = ++epoch;
-		retire();
+	const cursor = (event) =>
+		event ? { until: event.created_at, before_id: event.id } : undefined;
+	async function latest(signal) {
+		const since = meta.checkpoint,
+			initialized = meta.initialized;
+		const boundary = new Set(meta.boundaryIds || []),
+			nextBoundary = new Set(boundary);
+		let before,
+			newest = since,
+			first;
+		for (;;) {
+			const events = await read(
+				{
+					kinds: initialized ? CHANGE_KINDS : [9, 40002],
+					...(initialized ? { since } : {}),
+					...(before || {}),
+				},
+				signal,
+			);
+			first ??= events;
+			const ids = [],
+				unknownDeletes = [];
+			for (const event of events) {
+				if (event.created_at > newest) {
+					newest = event.created_at;
+					nextBoundary.clear();
+				}
+				if (event.created_at === newest) nextBoundary.add(event.id);
+				if ([9, 40002].includes(event.kind)) {
+					if (!records.has(event.id)) ids.push(event.id);
+					continue;
+				}
+				if (event.created_at === since && boundary.has(event.id)) continue;
+				const references = event.tags
+					.filter(([key, value]) => key === "e" && validId(value))
+					.map(([, value]) => value);
+				const targets = references.flatMap((id) => meta.aliases[id] || [id]);
+				if ([40003, 39005].includes(event.kind))
+					meta.aliases[event.id] = targets;
+				if (
+					[5, 9005].includes(event.kind) &&
+					targets.some((id) => !records.has(id))
+				)
+					unknownDeletes.push(event.id);
+				ids.push(...targets);
+			}
+			// An old overlay can predate this index. Only an unresolvable deletion
+			// requires repairing saved artifact rows; ordinary opens never reread them.
+			if (unknownDeletes.length)
+				ids.push(
+					...[...records.values()]
+						.filter((item) => item.row)
+						.map((item) => item.id),
+				);
+			await resolveIds(ids, signal);
+			if (!initialized || events.length < pageSize) break;
+			const next = cursor(events.at(-1));
+			if (before?.until === next.until && before?.before_id === next.before_id)
+				throw new Error("同步游标没有前进");
+			before = next;
+		}
+		if (!initialized) {
+			meta.older = cursor(first.at(-1));
+			meta.more = first.length === pageSize;
+			meta.pages = 1;
+		}
+		meta.initialized = true;
+		meta.checkpoint = newest;
+		meta.boundaryIds = [...nextBoundary];
+	}
+	async function older(signal) {
+		if (!meta.more || !meta.older) return;
+		const events = await read({ kinds: [9, 40002], ...meta.older }, signal);
+		await resolveIds(
+			events.filter((event) => !records.has(event.id)).map((event) => event.id),
+			signal,
+		);
+		if (events.length) meta.older = cursor(events.at(-1));
+		meta.more = events.length === pageSize;
+		meta.pages++;
+	}
+	async function sync(mode = "latest") {
+		if (!current()) {
+			revoke();
+			return;
+		}
+		if (state.pending) {
+			if (mode === "latest") queuedLive = true;
+			return;
+		}
+		retryMode = mode;
 		const owned = new AbortController();
 		controller = owned;
-		const cursor = head ? undefined : pageCursors[index];
-		publish({ rows: [], pending: true, error: "", changed: false });
+		publish({ pending: true, error: "", changed: false });
 		try {
-			const result = await session.readRemote(
-				[
-					{
-						kinds: [9, 40002],
-						"#h": [channelId],
-						limit: pageSize,
-						...(cursor ?? {}),
-					},
-				],
-				{ signal: owned.signal, fresh: true },
-			);
-			if (ownedEpoch !== epoch || !current() || owned.signal.aborted) return;
-			const events = [
-				...new Map(
-					result
-						.filter(
-							(e) =>
-								[9, 40002].includes(e.kind) &&
-								/^[0-9a-f]{64}$/.test(e.id) &&
-								e.tags.some(([k, v]) => k === "h" && v === channelId),
-						)
-						.map((e) => [e.id, e]),
-				).values(),
-			].sort((a, b) => b.created_at - a.created_at || a.id.localeCompare(b.id));
-			if (
-				events.length > pageSize ||
-				(cursor &&
-					events.some(
-						(e) =>
-							e.created_at > cursor.until ||
-							(e.created_at === cursor.until && e.id <= cursor.before_id),
-					))
-			)
-				throw new Error("历史分页游标不兼容");
-			if (head) {
-				pageCursors = [undefined];
-				index = 0;
+			if (mode === "older") await older(owned.signal);
+			else await latest(owned.signal);
+			if (!current() || owned.signal.aborted) return;
+			await persist();
+			if (current())
+				publish({ more: meta.more, page: meta.pages, cached: false });
+		} catch (error) {
+			if (current() && !owned.signal.aborted) {
+				await persist();
+				publish({ error: `产物读取失败：${error.message || "请重试同步"}` });
 			}
-			page = index;
-			const last = events.at(-1);
-			nextCursor = last
-				? { until: last.created_at, before_id: last.id }
-				: undefined;
-			publish({
-				page: page + 1,
-				scanned: events.length,
-				more: events.length === pageSize,
-			});
-			for (const event of events) {
-				const view = session.thread(channelId, event.id, { exact: true });
-				readers.push(view);
-				stops.push(view.subscribe(update));
-			}
-			// Host readers own scheduling, access and cancellation. Bound concurrent
-			// refreshes so a board does not flood the shared interactive read queue.
-			const queue = [...readers];
-			await Promise.all(
-				Array.from({ length: Math.min(3, queue.length) }, async () => {
-					while (queue.length && ownedEpoch === epoch && current())
-						await queue.shift().refresh();
-				}),
-			);
-			if (ownedEpoch !== epoch || !current() || owned.signal.aborted) return;
-			update();
-			const failures = readers.filter(
-				(v) => v.snapshot().targetStatus === "error",
-			).length;
-			publish({
-				pending: false,
-				error: failures ? `${failures} 条消息读取失败，请重试本页` : "",
-			});
-		} catch {
-			if (ownedEpoch === epoch && !owned.signal.aborted && current())
-				publish({ pending: false, error: "产物读取失败，请重试本页" });
 		} finally {
 			if (controller === owned) controller = undefined;
+			if (current()) {
+				publish({ pending: false });
+				if (queuedLive) {
+					queuedLive = false;
+					void sync();
+				}
+			}
 		}
 	}
 	const offChannel = session.channels.subscribeList(() => {
@@ -290,15 +594,17 @@ export function createReader(relay, connection, channelId, pageSize = 12) {
 		if (!current()) revoke();
 	});
 	const offLive = session.subscribeLive(({ events }) => {
+		if (!current()) return;
 		if (
-			current() &&
 			events.some(
-				(e) =>
-					[9, 40002].includes(e.kind) &&
-					e.tags.some(([k, v]) => k === "h" && v === channelId),
+				(event) =>
+					CHANGE_KINDS.includes(event.kind) &&
+					event.tags.some(([key, value]) => key === "h" && value === channelId),
 			)
-		)
+		) {
 			publish({ changed: true });
+			if (started) void sync();
+		}
 	});
 	return {
 		snapshot: () => state,
@@ -306,22 +612,128 @@ export function createReader(relay, connection, channelId, pageSize = 12) {
 			listeners.add(listener);
 			return () => listeners.delete(listener);
 		},
-		start: () => load(0, true),
-		retry: () => load(retryIndex, retryHead),
-		refresh: () => load(0, true),
-		next() {
-			if (!state.pending && state.more && nextCursor) {
-				pageCursors[page + 1] = nextCursor;
-				return load(page + 1);
+		async start() {
+			if (started || state.pending) return;
+			publish({ pending: true });
+			try {
+				const saved = await cache.load(partition);
+				if (!current()) return;
+				if (
+					saved?.meta?.initialized &&
+					Number.isSafeInteger(saved.meta.checkpoint) &&
+					saved.meta.checkpoint >= 0
+				) {
+					const value = saved.meta;
+					if (
+						typeof value.more !== "boolean" ||
+						!Number.isSafeInteger(value.pages) ||
+						value.pages < 0 ||
+						(value.older &&
+							(!Number.isSafeInteger(value.older.until) ||
+								value.older.until < 0 ||
+								!validId(value.older.before_id)))
+					)
+						throw new Error("Invalid local cursor");
+					meta = {
+						...meta,
+						initialized: true,
+						checkpoint: value.checkpoint,
+						more: value.more,
+						pages: value.pages,
+						older: value.older,
+						boundaryIds: Array.isArray(value.boundaryIds)
+							? value.boundaryIds.filter(validId)
+							: [],
+						aliases: Object.fromEntries(
+							Object.entries(value.aliases || {}).filter(
+								([id, targets]) =>
+									validId(id) &&
+									Array.isArray(targets) &&
+									targets.every(validId),
+							),
+						),
+					};
+					for (const item of Array.isArray(saved.records) ? saved.records : [])
+						if (
+							validId(item?.id) &&
+							(item.row === null ||
+								(item.row?.id === item.id &&
+									item.row.channelId === channelId &&
+									validId(item.row.authorId) &&
+									Number.isSafeInteger(item.row.createdAt) &&
+									item.row.createdAt >= 0 &&
+									typeof item.row.content === "string" &&
+									Array.isArray(item.row.attachments) &&
+									item.row.attachments.every(
+										(attachment) =>
+											attachment &&
+											typeof attachment.url === "string" &&
+											["image", "video", "audio", "file"].includes(
+												attachment.kind,
+											),
+									)))
+						)
+							records.set(item.id, item);
+					render();
+					publish({ cached: true, more: meta.more, page: meta.pages });
+				}
+			} catch {
+				cacheFailed();
+			} finally {
+				if (current()) {
+					started = true;
+					publish({ pending: false });
+				}
 			}
+			if (current()) await sync();
 		},
-		previous() {
-			if (!state.pending && page > 0) return load(page - 1);
+		retry: () => sync(retryMode),
+		refresh: () => sync(),
+		next: () => sync("older"),
+		async text(source, signal, key = source) {
+			if (!current()) throw new Error("阅读权限已变化");
+			validateTextSource(source);
+			const valid = (value) =>
+				value &&
+				typeof value.text === "string" &&
+				value.text.length <= 65536 &&
+				typeof value.truncated === "boolean";
+			let value = textMemory.get(key);
+			if (!value) {
+				try {
+					const saved = await cache.text(partition, key);
+					if (valid(saved)) value = saved;
+				} catch {
+					cacheFailed();
+				}
+			}
+			signal.throwIfAborted();
+			if (!current()) throw new Error("阅读权限已变化");
+			const fetched = !value;
+			if (!value) value = await readText(source, signal);
+			if (!current() || signal.aborted) throw new Error("阅读权限已变化");
+			textMemory.set(key, value);
+			if (fetched) {
+				writes = writes
+					.catch(() => {})
+					.then(async () => {
+						if (current() && !signal.aborted)
+							await cache.text(partition, key, value);
+					});
+				try {
+					await writes;
+				} catch {
+					cacheFailed();
+				}
+			}
+			if (!current() || signal.aborted) throw new Error("阅读权限已变化");
+			return value;
 		},
 		dispose() {
+			if (disposed) return;
 			disposed = true;
-			epoch++;
 			retire();
+			textMemory.clear();
 			offChannel();
 			offRelay();
 			offLive();
@@ -330,7 +742,7 @@ export function createReader(relay, connection, channelId, pageSize = 12) {
 	};
 }
 
-export async function readText(source, signal, request = fetch) {
+export function validateTextSource(source) {
 	// Only the host's authenticated media proxy; no arbitrary URL fetch, HTML execution,
 	// signed HTTP requests, network grants, or access to local filesystem paths.
 	const url = new URL(source, globalThis.location?.href);
@@ -370,6 +782,10 @@ export async function readText(source, signal, request = fetch) {
 		url.pathname.startsWith("/api/relay") &&
 		url.pathname.endsWith("/media");
 	if (!validNative && !proxy) throw new Error("此文件请通过原消息打开");
+}
+
+export async function readText(source, signal, request = fetch) {
+	validateTextSource(source);
 	const response = await request(source, {
 		signal,
 		credentials: "same-origin",
@@ -441,6 +857,8 @@ export function saveBookmarks(storage, key, ids) {
 export function apply(ctx) {
 	const R = ctx.react,
 		h = R.createElement;
+	const localCache = createLocalCache();
+	ctx.effect?.(() => () => localCache.close());
 	const prefix = "opcb:chat-artifacts:";
 	const labels = {
 		all: "全部",
@@ -516,7 +934,7 @@ export function apply(ctx) {
 		}, []);
 		return [ref, width];
 	}
-	function Preview({ entry, session }) {
+	function Preview({ entry, session, store }) {
 		const ref = R.useRef(null),
 			[visible, setVisible] = R.useState(false);
 		const [failedSource, setFailedSource] = R.useState("");
@@ -587,6 +1005,8 @@ export function apply(ctx) {
 							},
 							h(TextPreview, {
 								source: session.media(entry.url),
+								cacheKey: entry.url,
+								store,
 								name: entry.name,
 								compact: true,
 							}),
@@ -827,13 +1247,20 @@ export function apply(ctx) {
 			...nodes,
 		);
 	}
-	function TextPreview({ source, name = "", compact = false }) {
+	function TextPreview({
+		source,
+		name = "",
+		compact = false,
+		store,
+		cacheKey,
+	}) {
 		const [data, setData] = R.useState({ pending: true });
 		const [retry, setRetry] = R.useState(0);
 		R.useEffect(() => {
 			const controller = new AbortController();
 			setData({ pending: true });
-			readText(source, controller.signal)
+			store
+				.text(source, controller.signal, cacheKey)
 				.then((result) => {
 					if (!controller.signal.aborted) setData(result);
 				})
@@ -841,7 +1268,7 @@ export function apply(ctx) {
 					if (!controller.signal.aborted) setData({ error: true });
 				});
 			return () => controller.abort();
-		}, [source, retry]);
+		}, [source, retry, store, cacheKey]);
 		if (data.pending) return note("正在读取文档…");
 		if (data.error && compact) return note("打开查看文档或来源消息");
 		if (data.error)
@@ -873,7 +1300,7 @@ export function apply(ctx) {
 					),
 		);
 	}
-	function Detail({ entry, connection, channelContext, context }) {
+	function Detail({ entry, connection, channelContext, context, store }) {
 		const session = connection.session;
 		const channelId = channelContext.channelId;
 		const source = entry.attachment ? session.media(entry.url) : undefined;
@@ -918,7 +1345,13 @@ export function apply(ctx) {
 			),
 			textual &&
 				source &&
-				h(TextPreview, { key: entry.id, source, name: entry.name }),
+				h(TextPreview, {
+					key: entry.id,
+					source,
+					name: entry.name,
+					store,
+					cacheKey: entry.url,
+				}),
 			h("h4", null, "来源内容"),
 			h(
 				ctx.conversation.ui.Conversation,
@@ -951,6 +1384,8 @@ export function apply(ctx) {
 				ctx.relay,
 				connection,
 				channelContext.channelId,
+				12,
+				localCache,
 			);
 			setStore(reader);
 			void reader.start();
@@ -1149,7 +1584,7 @@ export function apply(ctx) {
 				},
 				h("input", {
 					type: "search",
-					"aria-label": "搜索文件名（本页）",
+					"aria-label": "搜索已加载产物",
 					placeholder: "搜索文件名",
 					value: query,
 					onChange: (e) => setQuery(e.target.value),
@@ -1265,10 +1700,10 @@ export function apply(ctx) {
 					h(
 						"span",
 						{ role: "status" },
-						`第 ${data.page} 页 · ${data.scanned} 条消息 · ${shown.length} 项产物`,
+						`已加载 ${entries.length} 项产物 · 筛选显示 ${shown.length} 项${data.cached ? " · 本地缓存" : ""}${data.pending ? " · 正在同步" : ""}`,
 					),
 					data.changed &&
-						button("有新消息，回到最新", () => pageAction("refresh"), {
+						button("同步最新产物", () => pageAction("refresh"), {
 							disabled: data.pending,
 						}),
 				),
@@ -1278,7 +1713,7 @@ export function apply(ctx) {
 						{ role: "alert", style: { padding: "8px 20px" } },
 						data.error,
 						" ",
-						button("重试本页", () => pageAction("retry"), {
+						button("重试同步", () => pageAction("retry"), {
 							disabled: data.pending,
 						}),
 					),
@@ -1287,6 +1722,12 @@ export function apply(ctx) {
 						"p",
 						{ role: "alert", style: { paddingInline: 20 } },
 						"收藏未能保存到本机",
+					),
+				data.cacheError &&
+					h(
+						"p",
+						{ role: "alert", style: { paddingInline: 20 } },
+						data.cacheError,
 					),
 				h(
 					"div",
@@ -1312,6 +1753,7 @@ export function apply(ctx) {
 								connection,
 								channelContext,
 								context,
+								store,
 							}),
 						),
 					h(
@@ -1391,7 +1833,7 @@ export function apply(ctx) {
 								),
 								layout === "grid" &&
 									button(
-										h(Preview, { entry: item, session }),
+										h(Preview, { entry: item, session, store }),
 										(event) => inspect(item, event),
 										{
 											"aria-label": `查看 ${item.name}`,
@@ -1441,9 +1883,6 @@ export function apply(ctx) {
 								padding: "16px 0",
 							},
 						},
-						button("上一页", () => pageAction("previous"), {
-							disabled: data.pending || data.page === 1,
-						}),
 						button("加载更早产物", () => pageAction("next"), {
 							disabled: data.pending || !data.more,
 						}),
@@ -1458,7 +1897,7 @@ export function apply(ctx) {
 								textAlign: "center",
 							},
 						},
-						"包含线程回复 · 搜索与筛选作用于本页",
+						"包含线程回复 · 新旧产物累计保留 · 搜索覆盖已加载产物",
 					),
 				),
 			),

@@ -2,7 +2,7 @@
 	"id": "opcb.chat-artifacts",
 	"name": "聊天产物",
 	"apiVersion": 1,
-	"description": "在当前聊天查看文件、图片、视频和链接，搜索分类并回到来源消息。独立于 Buzz 客户端更新。",
+	"description": "本机保存聊天产物清单与已读文档预览，历史累计加载，重开即看；增量同步新增、编辑和删除，并可回到来源消息。",
 	"discovery": {
 		"category": "productivity",
 		"tags": ["artifacts", "files", "chat"]

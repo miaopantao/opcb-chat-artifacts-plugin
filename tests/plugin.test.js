@@ -4,15 +4,66 @@ import {
 	apply,
 	artifactsFrom,
 	bookmarkKey,
+	cacheScope,
 	canRead,
-	createReader,
 	inject,
 	linksIn,
+	createReader as openReader,
 	readBookmarks,
 	readText,
 	safeUrl,
 	saveBookmarks,
 } from "../plugin.js";
+
+function memoryCache() {
+	const partitions = new Map(),
+		texts = new Map();
+	const state = (scope) => {
+		if (!partitions.has(scope))
+			partitions.set(scope, { records: new Map(), meta: undefined });
+		return partitions.get(scope);
+	};
+	return {
+		partitions,
+		async load(scope) {
+			const saved = state(scope);
+			return structuredClone({
+				records: [...saved.records.values()],
+				meta: saved.meta,
+			});
+		},
+		async commit(scope, records, meta) {
+			const saved = state(scope);
+			for (const record of records)
+				saved.records.set(record.id, structuredClone(record));
+			saved.meta = structuredClone(meta);
+		},
+		async text(scope, source, value) {
+			const key = JSON.stringify([scope, source]);
+			if (value !== undefined) texts.set(key, structuredClone(value));
+			return structuredClone(texts.get(key));
+		},
+		async clear(scope) {
+			partitions.delete(scope);
+			for (const key of texts.keys())
+				if (JSON.parse(key)[0] === scope) texts.delete(key);
+		},
+	};
+}
+const createReader = (
+	relay,
+	connection,
+	channel,
+	pageSize = 12,
+	cache = memoryCache(),
+) => openReader(relay, connection, channel, pageSize, cache);
+const until = async (condition) => {
+	for (let i = 0; i < 100; i++) {
+		if (condition()) return;
+		await new Promise((resolve) => setImmediate(resolve));
+	}
+	assert.fail("expected async state was not reached");
+};
 
 test("bookmarks are isolated by community, account and channel and survive reload", () => {
 	const values = new Map(),
@@ -148,7 +199,7 @@ function fixture(read = async () => [event(1), event(2)]) {
 					view.update({
 						targetStatus: "ready",
 						target: row(Number.parseInt(messageId, 16), {
-							content: "host-folded edited content",
+							content: "host-folded edited content https://example.com/result",
 						}),
 					});
 				},
@@ -248,10 +299,16 @@ test("only the host's folded exact target is shown, including replies and live d
 	const f = fixture(),
 		reader = createReader(f.relay, f.connection, channelId);
 	await reader.start();
-	assert.equal(reader.snapshot().rows[0].content, "host-folded edited content");
+	assert.equal(
+		reader.snapshot().rows[0].content,
+		"host-folded edited content https://example.com/result",
+	);
 	f.views[0].update({
 		targetStatus: "ready",
-		target: row(1, { threadRootId: id(8), content: "reply" }),
+		target: row(1, {
+			threadRootId: id(8),
+			content: "reply https://example.com/result",
+		}),
 	});
 	assert.equal(reader.snapshot().rows[0].threadRootId, id(8));
 	f.views[0].update({ targetStatus: "unavailable", target: undefined });
@@ -281,9 +338,11 @@ test("same-second pages use the relay cursor, not the folded/display rows", asyn
 	});
 	assert.equal(reader.snapshot().page, 2);
 	assert.equal(reader.snapshot().more, false);
-	assert.ok(f.views.slice(0, 2).every((v) => v.disposed));
-	await reader.previous();
-	assert.equal(reader.snapshot().page, 1);
+	assert.deepEqual(
+		reader.snapshot().rows.map((r) => r.id),
+		[id(1), id(3)],
+	);
+	assert.equal(f.requests.length, 2);
 	reader.dispose();
 });
 
@@ -310,6 +369,7 @@ test("revocation cancels reads and fences a late response that ignores abort", a
 		f = fixture(() => gate.promise),
 		reader = createReader(f.relay, f.connection, channelId);
 	const started = reader.start();
+	await until(() => f.requests.length > 0);
 	f.revoke();
 	assert.equal(f.requests[0][1].signal.aborted, true);
 	gate.resolve([event(1)]);
@@ -330,11 +390,12 @@ test("a new session retires current views and cannot retain private results", as
 	reader.dispose();
 });
 
-test("failed discovery can retry; new messages only offer refresh instead of resetting the page", async () => {
+test("failed discovery can retry; live events sync incrementally without replacing saved rows", async () => {
 	let fail = true;
+	let newest = false;
 	const f = fixture(async () => {
 		if (fail) throw new Error("offline");
-		return [event(1)];
+		return newest ? [event(9, 101)] : [event(1)];
 	});
 	const reader = createReader(f.relay, f.connection, channelId);
 	await reader.start();
@@ -342,9 +403,15 @@ test("failed discovery can retry; new messages only offer refresh instead of res
 	fail = false;
 	await reader.retry();
 	assert.equal(reader.snapshot().rows.length, 1);
-	f.emit([event(9)]);
-	assert.equal(reader.snapshot().changed, true);
-	assert.equal(f.requests.length, 2);
+	newest = true;
+	f.emit([event(9, 101)]);
+	await until(() => !reader.snapshot().pending);
+	assert.deepEqual(
+		reader.snapshot().rows.map((r) => r.id),
+		[id(1), id(9)],
+	);
+	assert.equal(f.requests.length, 3);
+	assert.equal(f.requests[2][0][0].since, 100);
 	reader.dispose();
 });
 
@@ -420,4 +487,370 @@ test("plugin activation registers only a scoped channel panel, with no host proc
 	assert.equal(panels[0].channelPlacement, "tab");
 	assert.equal(panels[0].matches("opcb:chat-artifacts:channel"), true);
 	assert.equal(panels[0].matches("https://example.com"), false);
+});
+
+test("older loads append instead of replacing, and failed sync never blanks saved artifacts", async () => {
+	let offline = false;
+	const f = fixture(async ([filter]) => {
+		if (offline) throw Error("offline");
+		return filter.before_id ? [event(3, 99)] : [event(1, 101), event(2, 100)];
+	});
+	const reader = createReader(f.relay, f.connection, channelId, 2);
+	await reader.start();
+	await reader.next();
+	assert.deepEqual(
+		reader.snapshot().rows.map((r) => r.id),
+		[id(1), id(2), id(3)],
+	);
+	offline = true;
+	await reader.refresh();
+	assert.equal(reader.snapshot().rows.length, 3);
+	assert.match(reader.snapshot().error, /offline/);
+	reader.dispose();
+});
+
+test("reopen presents saved artifacts before the network settles, reads only changes and retains the older cursor", async () => {
+	const cache = memoryCache(),
+		first = fixture(async ([filter]) =>
+			filter.before_id
+				? [event(3, 99), event(4, 98)]
+				: [event(1, 101), event(2, 100)],
+		);
+	const old = createReader(first.relay, first.connection, channelId, 2, cache);
+	await old.start();
+	await old.next();
+	old.dispose();
+	const gate = deferred(),
+		second = fixture(() => gate.promise);
+	const reopened = createReader(
+		second.relay,
+		second.connection,
+		channelId,
+		2,
+		cache,
+	);
+	const starting = reopened.start();
+	await until(() => second.requests.length === 1);
+	assert.equal(reopened.snapshot().rows.length, 4);
+	assert.equal(reopened.snapshot().cached, true);
+	assert.equal(reopened.snapshot().pending, true);
+	assert.equal(second.requests[0][0][0].since, 101);
+	assert.equal(second.views.length, 0);
+	gate.resolve([event(9, 102)]);
+	await starting;
+	assert.equal(reopened.snapshot().rows.length, 5);
+	assert.equal(second.views.length, 1);
+	assert.equal(
+		(await cache.load(cacheScope(second.connection, channelId))).meta.older
+			.before_id,
+		id(4),
+	);
+	reopened.dispose();
+});
+
+test("same-second incremental catch-up drains every page and does not recreate known readers", async () => {
+	const cache = memoryCache(),
+		first = fixture(async () => [event(1, 100)]);
+	const old = createReader(first.relay, first.connection, channelId, 2, cache);
+	await old.start();
+	old.dispose();
+	const second = fixture(async ([filter]) => {
+		assert.equal(filter.since, 100);
+		return filter.before_id ? [event(3, 100)] : [event(1, 100), event(2, 100)];
+	});
+	const reopened = createReader(
+		second.relay,
+		second.connection,
+		channelId,
+		2,
+		cache,
+	);
+	await reopened.start();
+	assert.equal(second.requests.length, 2);
+	assert.equal(second.views.length, 2);
+	assert.deepEqual(
+		reopened.snapshot().rows.map((r) => r.id),
+		[id(1), id(2), id(3)],
+	);
+	reopened.dispose();
+});
+
+test("missed edits and deletes update old cached artifacts through the host's exact fold", async () => {
+	const cache = memoryCache(),
+		first = fixture();
+	const old = createReader(first.relay, first.connection, channelId, 12, cache);
+	await old.start();
+	old.dispose();
+	const edit = {
+			...event(70, 110),
+			kind: 40003,
+			tags: [
+				["h", channelId],
+				["e", id(1)],
+			],
+		},
+		deletion = {
+			...event(71, 111),
+			kind: 5,
+			tags: [
+				["h", channelId],
+				["e", id(2)],
+			],
+		};
+	const second = fixture(async () => [deletion, edit]);
+	const open = second.session.thread;
+	second.session.thread = (...args) => {
+		const view = open(...args);
+		view.refresh = async () =>
+			view.update(
+				args[1] === id(2)
+					? { targetStatus: "unavailable" }
+					: {
+							targetStatus: "ready",
+							target: row(1, { content: "edited https://example.com/new" }),
+						},
+			);
+		return view;
+	};
+	const reopened = createReader(
+		second.relay,
+		second.connection,
+		channelId,
+		12,
+		cache,
+	);
+	await reopened.start();
+	assert.deepEqual(
+		reopened.snapshot().rows.map((r) => r.content),
+		["edited https://example.com/new"],
+	);
+	reopened.dispose();
+	const third = fixture(async () => []),
+		again = createReader(third.relay, third.connection, channelId, 12, cache);
+	await again.start();
+	assert.equal(again.snapshot().rows.length, 1);
+	assert.equal(third.views.length, 0);
+	again.dispose();
+});
+
+test("a failed target cannot advance the saved incremental checkpoint", async () => {
+	const cache = memoryCache(),
+		f = fixture();
+	const reader = createReader(f.relay, f.connection, channelId, 12, cache);
+	await reader.start();
+	const edit = {
+		...event(70, 110),
+		kind: 40003,
+		tags: [
+			["h", channelId],
+			["e", id(1)],
+		],
+	};
+	f.session.readRemote = async (...args) => {
+		f.requests.push(args);
+		return [edit];
+	};
+	f.views[0].refresh = async () => f.views[0].update({ targetStatus: "error" });
+	await reader.refresh();
+	assert.equal(reader.snapshot().rows.length, 2);
+	assert.equal(
+		(await cache.load(cacheScope(f.connection, channelId))).meta.checkpoint,
+		100,
+	);
+	reader.dispose();
+});
+
+test("200 accumulated messages keep at most 12 host readers and dispose all subscriptions", async () => {
+	const events = Array.from({ length: 200 }, (_, i) => event(i + 1, 1000 - i));
+	const f = fixture(async ([filter]) =>
+		events
+			.filter(
+				(e) =>
+					filter.until === undefined ||
+					e.created_at < filter.until ||
+					(e.created_at === filter.until && e.id > filter.before_id),
+			)
+			.slice(0, filter.limit),
+	);
+	const reader = createReader(f.relay, f.connection, channelId);
+	await reader.start();
+	let peak = 0;
+	while (reader.snapshot().more) {
+		await reader.next();
+		peak = Math.max(peak, f.views.filter((view) => !view.disposed).length);
+	}
+	assert.equal(reader.snapshot().rows.length, 200);
+	assert.ok(peak <= 12);
+	reader.dispose();
+	assert.equal(f.owned(), 0);
+	assert.ok(f.views.every((view) => view.disposed));
+});
+
+test("cache write failure is visible without losing the working collection", async () => {
+	const cache = memoryCache();
+	cache.commit = async () => {
+		throw Error("disk full");
+	};
+	const f = fixture(),
+		reader = createReader(f.relay, f.connection, channelId, 12, cache);
+	await reader.start();
+	assert.equal(reader.snapshot().rows.length, 2);
+	assert.match(reader.snapshot().cacheError, /本地缓存/);
+	reader.dispose();
+});
+
+test("late local hydration cannot repopulate a revoked panel; reconnect does not erase the cache", async () => {
+	const cache = memoryCache(),
+		f = fixture(),
+		old = createReader(f.relay, f.connection, channelId, 12, cache);
+	await old.start();
+	old.dispose();
+	const saved = await cache.load(cacheScope(f.connection, channelId)),
+		gate = deferred();
+	const second = fixture(),
+		delayedCache = { ...cache, load: () => gate.promise };
+	const reader = createReader(
+		second.relay,
+		second.connection,
+		channelId,
+		12,
+		delayedCache,
+	);
+	const starting = reader.start();
+	second.revoke();
+	gate.resolve(saved);
+	await starting;
+	assert.equal(reader.snapshot().rows.length, 0);
+	assert.equal(second.requests.length, 0);
+	reader.dispose();
+	const third = fixture(),
+		restored = createReader(
+			third.relay,
+			third.connection,
+			channelId,
+			12,
+			cache,
+		);
+	await restored.start();
+	third.reconnect();
+	await until(() => restored.snapshot().rows.length === 0);
+	assert.ok(
+		(await cache.load(cacheScope(third.connection, channelId))).records.length >
+			0,
+	);
+	restored.dispose();
+});
+
+test("cached document preview is scoped and does not make a network request", async () => {
+	const cache = memoryCache(),
+		f = fixture(),
+		reader = createReader(f.relay, f.connection, channelId, 12, cache);
+	await reader.start();
+	const source = `http://buzz-media.localhost/${encodeURIComponent(`https://relay.example/media/${id(1)}.md`)}`;
+	await cache.text(cacheScope(f.connection, channelId), source, {
+		text: "saved document",
+		truncated: false,
+	});
+	assert.deepEqual(await reader.text(source, new AbortController().signal), {
+		text: "saved document",
+		truncated: false,
+	});
+	await assert.rejects(
+		reader.text("file:///etc/passwd", new AbortController().signal),
+	);
+	f.revoke();
+	await assert.rejects(
+		reader.text(source, new AbortController().signal),
+		/权限/,
+	);
+	reader.dispose();
+});
+
+test("an already synchronized boundary edit is not fetched again on reopen", async () => {
+	const cache = memoryCache(),
+		first = fixture();
+	const reader = createReader(
+		first.relay,
+		first.connection,
+		channelId,
+		12,
+		cache,
+	);
+	await reader.start();
+	const edit = {
+		...event(80, 110),
+		kind: 40003,
+		tags: [
+			["h", channelId],
+			["e", id(1)],
+		],
+	};
+	first.session.readRemote = async () => [edit];
+	await reader.refresh();
+	reader.dispose();
+	const second = fixture(async () => [edit]),
+		reopened = createReader(
+			second.relay,
+			second.connection,
+			channelId,
+			12,
+			cache,
+		);
+	await reopened.start();
+	assert.equal(second.views.length, 0);
+	assert.equal(reopened.snapshot().rows.length, 2);
+	reopened.dispose();
+});
+
+test("revocation during a text-cache commit fences its late return and clears saved bytes", async () => {
+	const cache = memoryCache(),
+		f = fixture(),
+		reader = createReader(f.relay, f.connection, channelId, 12, cache);
+	await reader.start();
+	const gate = deferred(),
+		originalText = cache.text;
+	let writing = false;
+	cache.text = async (...args) => {
+		if (args[2]) {
+			writing = true;
+			await gate.promise;
+		}
+		return originalText(...args);
+	};
+	const source = `http://buzz-media.localhost/${encodeURIComponent(`https://relay.example/media/${id(4)}.md`)}`;
+	const originalFetch = globalThis.fetch;
+	globalThis.fetch = async () => new Response("private document");
+	try {
+		const result = reader.text(source, new AbortController().signal);
+		await until(() => writing);
+		f.revoke();
+		gate.resolve();
+		await assert.rejects(result, /权限/);
+		await until(() => cache.partitions.size === 0);
+		assert.equal(
+			await originalText(cacheScope(f.connection, channelId), source),
+			undefined,
+		);
+	} finally {
+		globalThis.fetch = originalFetch;
+		reader.dispose();
+	}
+});
+
+test("a corrupt persisted cursor falls back to a fresh head without sending it to the relay", async () => {
+	const cache = memoryCache(),
+		f = fixture();
+	await cache.commit(cacheScope(f.connection, channelId), [], {
+		initialized: true,
+		checkpoint: 100,
+		pages: 2,
+		more: true,
+		older: { until: "bad", before_id: "bad" },
+	});
+	const reader = createReader(f.relay, f.connection, channelId, 12, cache);
+	await reader.start();
+	assert.equal(reader.snapshot().rows.length, 2);
+	assert.equal(f.requests[0][0][0].since, undefined);
+	assert.equal(f.requests[0][0][0].until, undefined);
+	reader.dispose();
 });
